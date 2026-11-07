@@ -1,0 +1,39 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 7afb190..c8f21e4 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -240,17 +240,29 @@ static const amfi_t sweet_amfi = {
+ 
+ #include <mach-o/loader.h>
+ #include <libkern/kernel_mach_header.h>
++#include <pexpert/pexpert.h>
+ 
+ /* True when the built-in interface is the one in use (no original AMFI). */
+ static SECURITY_READ_ONLY_LATE(bool) sweet_amfi_builtin;
+ 
+ __startup_func
+ static void
+ sweet_amfi_register(void)
+ {
+ 	kernel_segment_command_t *prelink = getsegbyname("__PRELINK_TEXT");
+-	if (amfi != NULL || (prelink != NULL && prelink->vmsize != 0)) {
++	/*
++	 * Boot-arg sweet_amfi_builtin=1: take the built-in interface even though
++	 * tools/mkprelink.py prelinked Apple's original AMFI. The original one runs CoreTrust,
++	 * which rejects the adhoc-signed dyld shared cache ("unsuitable CT policy 0 for this
++	 * platform/device, rejecting signature"); launchd then cannot load libSystem.
++	 * The built-in interface marks rootfs binaries CS_SIGNED|CS_PLATFORM_BINARY itself
++	 * (patches 0035/0036), so dyld can map the cache.
++	 */
++	int force_builtin = 0;
++	(void)PE_parse_boot_argn("sweet_amfi_builtin", &force_builtin, sizeof(force_builtin));
++	if (!force_builtin &&
++	    (amfi != NULL || (prelink != NULL && prelink->vmsize != 0))) {
+ 		/* Original kexts are prelinked (PANDORA, tools/mkprelink.py, always with AMFI):
+ 		 * the original AMFI registers the interface while the security extensions load. */
+ 		printf("SWEET AMFI: original AMFI prelinked; built-in not registered\n");
+ 		return;
+ 	}
+ 	sweet_amfi_builtin = true;
++	printf("SWEET AMFI: built-in interface registered (sweet_amfi_builtin=%d, prelink vmsize %#lx)\n",
++	    force_builtin, prelink != NULL ? (unsigned long)prelink->vmsize : 0UL);

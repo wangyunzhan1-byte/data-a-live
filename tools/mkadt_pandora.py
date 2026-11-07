@@ -15,6 +15,8 @@ Usage:  mkadt_pandora.py OUT.adt [--dump] [--qemu]
            /chosen pandora-log-extents + pandora-log-blocks, same layout.
   --fw-extents JSON    a pinned firmware pack (tools/mkfwpack.py, patch 0144):
            /chosen pandora-fw-extents + pandora-fw-blocks, same layout.
+  --amp                cores 0-5 as the E cluster and 6-7 as the P cluster (kernels with patch 0320
+           only; others assert on a second cluster).
   --gpu-pool MIB       carve MIB MiB below the panic log off the RAM given to XNU for the GPU
            buffer pool (pandora_gpu.c): /chosen pandora-gpu-pool = <u64 base, u64 size>.
            XNU never manages those pages, so mapping them by physical address is plain.
@@ -44,6 +46,10 @@ HIGH_MEM_SIZE = 0xfcc00000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
+# The audio DSP's buffer: the DSP takes 32-bit addresses (the stream index rides in the upper word,
+# pandora_adsp.c), and XNU's RAM is all above 0x8c0000000. Free DRAM in the phone's live DT: inside
+# /memory 0xa6980000-0xc3dd0000, no fixed reserved-memory region (the dynamic pools there are Linux's).
+DSP_SHM, DSP_SHM_SIZE = 0xb0000000, 0x100000
 GICD, GICD_SIZE = 0x17000000, 0x10000
 GICR, GICR_SIZE = 0x17080000, 0x200000   # 8 redistributors, stride 0x40000
 FB, FB_SIZE = 0xfc800000, 0x2b00000      # splash_region; ARGB8888, measured by shim/hello
@@ -83,7 +89,22 @@ def d22ap_product(path=D22AP_ADT):
             return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
     raise SystemExit(f'{path}: no /product node')
 
-u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
+
+def d22ap_product_child(name, path=D22AP_ADT):
+    """Properties of /product/NAME of the real D22AP tree (as d22ap_product), or None. VirtualAudio reads
+    IODeviceTree:/product/audio (aud8: "IORegistryEntryFromPath IODeviceTree:/product/audio returned
+    MACH_PORT_NULL")."""
+    if not os.path.exists(path):
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            for g in c.children:
+                if dict((k, v) for k, f, v in g.props).get('name') == cstr(name):
+                    return [(k, v) for k, f, v in g.props if not f and k not in ('name', 'AAPL,phandle')]
+    return None
+
+u32 =lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
 
@@ -154,7 +175,7 @@ def empty_nvram_proxy():
             ('nvram-current-bank', u32(0)), ('nvram-proxy-data', bytes(image))]
 
 
-def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
+def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0, amp=False):
     """qemu=True: QEMU virt twin (GIC, CNTFRQ, RAM, framebuffer). qemu_gic=True: only GIC/CNTFRQ."""
     phys_base, mem_size = (QEMU_PHYS_BASE, QEMU_MEM_SIZE) if qemu else (PHYS_BASE, MEM_SIZE)
     fb, fb_size, fb_w, fb_h, fb_stride = ((QEMU_FB, QEMU_FB_SIZE, QEMU_FB_W, QEMU_FB_H, QEMU_FB_STRIDE)
@@ -167,6 +188,8 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
         assert gpu_pool % 0x100000 == 0 and gpu_pool < mem_size // 2, 'gpu pool size'
         mem_size -= gpu_pool
         root_props = list(root_props) + [('pandora-gpu-pool', u64(phys_base + mem_size) + u64(gpu_pool))]
+    if not qemu:
+        root_props = list(root_props) + [('pandora-dsp-shm', u64(DSP_SHM) + u64(DSP_SHM_SIZE))]
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu or qemu_gic else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -204,17 +227,23 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
         # DeviceType then takes its native "Hactivation" branch (state
         # Activated without an activation record; no SEP, no baseband here).
+        # Security status exactly as the real iPhone X (D22AP) device tree carries it:
+        # certificate-security-mode 0, effective-security-mode-sep 0, effective-security-mode-ap
+        # 0 (checked against Firmware/all_flash/DeviceTree.d22ap.im4p). A dev-fused tuple of
+        # (0,0,0,0) is what makes the prelinked AMFI accept an adhoc-signed dyld shared cache;
+        # with 1 AMFI runs the production CoreTrust policy and answers "unsuitable CT policy 0
+        # for this platform/device, rejecting signature".
         ('certificate-production-status', u32(0)),
         ('effective-production-status-ap', u32(0)),
-        ('certificate-security-mode', u32(1)),
-        ('effective-security-mode-sep', u32(1)),
+        ('certificate-security-mode', u32(0)),
+        ('effective-security-mode-sep', u32(0)),
         # Read by the original AppleImage4 (prelinked, tools/mkprelink.py) at start-up,
         # which panics without them ("failed to get mix-n-match policy: 2"). Both are
         # iBoot-filled placeholders in the iPhone X device tree: 0 = mix-n-match allowed
         # (AppleImage4 takes status == 0 as allowed); the AP security mode matches
         # certificate-security-mode above.
         ('mix-n-match-prevention-status', u32(0)),
-        ('effective-security-mode-ap', u32(1)),
+        ('effective-security-mode-ap', u32(0)),
         # Read by the original AMFI (prelinked), which panics "no amfi-only-platform-code
         # device tree node!" / "no protected-data-access ..." without them. Values of the
         # iPhone X device tree template: AMFI not limited to platform code (as on a retail
@@ -224,12 +253,14 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
         ('amfi-allows-trust-cache-load', u32(0)),
     ] + empty_nvram_proxy() + [
     ] + list(root_props), [node('memory-map', [ph()]),
-        # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
-        # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
-        # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
-        # The iOS shared cache is in no trust cache, so dyld can only map it
-        # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
-        node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))]),
+        # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`.
+        # lp-sip0 bits: untrusted kexts 0x001, unrestricted FS 0x002, task_for_pid 0x004,
+        # kernel debugger 0x008, dtrace 0x020, nvram 0x040, unauthenticated root 0x800.
+        # 0x800 matters: the kernel logs "root volume is not authenticated (error 25);
+        # continuing unsealed", so the root really is unsealed and the policy has to say so.
+        # The iOS shared cache is in no trust cache (ref/ios-sweet/tools/mkadt.py), so dyld
+        # can only map it with the FS and root restrictions lifted.
+        node('asmb', [ph(), ('lp-sip0', u64(0x86f)), ('lp-sip1', u32(1))]),
         # The original AppleImage4 panics "failed to get manifest properties" without this
         # node (iBoot publishes the boot manifest's properties here), as in UniXNU's sheng
         # ADT. iOS 16's AppleImage4 also reads BNCH, the 48-byte (SHA-384) boot nonce hash
@@ -239,17 +270,21 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
 
     # Eight Oryon cores in DT order with their real MPIDRs, described as one homogeneous
     # cluster like ios-sweet (no AMP code paths). cpus=N selects a prefix.
+    # amp (--amp, kernels with patch 0320 only): the six performance cores as the E cluster and the
+    # two prime cores as the P cluster ("cluster-type" 'E'/'P', which ml_parse_cpu_topology reads
+    # and turns into clusters 0 and 1). A kernel built for one cluster asserts on cluster 1.
     # QEMU keeps a single CPU (MPIDR 0).
     cpu_nodes = []
     for core in range(1 if qemu or qemu_gic else len(MPIDRS)):
+        prime = core >= 6
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
             ('compatible', cstr('qcom,sm8850-cpu') + cstr('ARM,v8')),
             ('reg', u32(MPIDRS[core])),  # actual MPIDR, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
-            ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
-            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
+            ('cluster-id', u32(int(prime) if amp else 0)),  # descriptive; see ml_parse_cpu_topology
+            ('cluster-type', u32(ord('P' if prime else 'E') if amp else 0)),  # 0: CLUSTER_TYPE_SMP
             ('die-cluster-id', u32(0)),
             ('cluster-core-id', u32(core)),
             ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
@@ -265,10 +300,14 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
                          ('#size-cells', u32(0))], cpu_nodes)
 
+    # The GIC is also IOKit's interrupt controller (patch 0216, iokit/Kernel/arm/SweetGIC.cpp): nubs name it
+    # in "interrupt-parent" and give "interrupts" as <INTID, Linux trigger flags> (#interrupt-cells 2).
+    gic_phandle = next(phandle)
     gic = node('gic', [
-        ph(),
+        ('AAPL,phandle', u32(gic_phandle)),
         ('compatible', cstr('arm,gic-v3')),
         ('interrupt-controller', b''),
+        ('#interrupt-cells', u32(2)),
         ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu or qemu_gic else VTIMER_INTID)),
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
     ])
@@ -288,12 +327,33 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
         # with this device_type and reads the canvas size from the node
         # (the presented iPhone X size, see SweetFramebuffer.cpp);
         # the kernel's AppleCLCD matches the compatible string.
+        # Its interrupt (patch 0221): the MDSS line, phone DT qcom,mdss_mdp@9800000 interrupts
+        # <GIC_SPI 83 IRQ_TYPE_LEVEL_HIGH> = INTID 115; SweetFramebuffer.cpp takes CTL0's frame start from it.
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
+            ('interrupt-parent', u32(gic_phandle)),
+            ('interrupts', u32(32 + 83) + u32(4)),
+        ]),
+        # The Adreno 840 (patch 0216): its interrupt line for PandoraAdrenoGpu.cpp. The phone's DT
+        # (qcom,kgsl-3d0@3d00000) gives kgsl_3d0_irq as <GIC_SPI 300 IRQ_TYPE_LEVEL_HIGH> = INTID 332.
+        node('gpu', [
+            ph(),
+            ('compatible', cstr('qcom,adreno-840') + cstr('qcom,adreno-gpu-gen8-2-1')),
+            ('interrupt-parent', u32(gic_phandle)),
+            ('interrupts', u32(32 + 300) + u32(4)),
+        ]),
+        # The IPCC (patch 0232): the remote processors' doorbells for PandoraIpcc.cpp and
+        # bsd/dev/pandora_adsp.c. The phone's DT qcom,ipcc@1106000 gives <GIC_SPI 246
+        # IRQ_TYPE_LEVEL_HIGH> = INTID 278.
+        node('ipcc', [
+            ph(),
+            ('compatible', cstr('qcom,ipcc')),
+            ('interrupt-parent', u32(gic_phandle)),
+            ('interrupts', u32(32 + 246) + u32(4)),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -331,7 +391,9 @@ def build(seed=None, qemu=False, qemu_gic=False, root_props=(), gpu_pool=0):
     ])
 
     product_props = d22ap_product()
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    audio_props = d22ap_product_child('audio')
+    product_kids = [node('audio', [ph()] + audio_props)] if audio_props is not None else []
+    product = [node('product', [ph()] + product_props, product_kids)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
     # dram-size we expose, so XNU maps it but never allocates into it.
@@ -374,7 +436,8 @@ if __name__ == '__main__':
     pool = int(opt('--gpu-pool'), 0) << 20 if opt('--gpu-pool') else 0
     if pool:
         print(f'gpu pool: {pool >> 20} MiB', file=sys.stderr)
-    root = build(qemu='--qemu' in sys.argv, qemu_gic='--qemu-gic' in sys.argv, root_props=props, gpu_pool=pool)
+    root = build(qemu='--qemu' in sys.argv, qemu_gic='--qemu-gic' in sys.argv, root_props=props, gpu_pool=pool,
+                 amp='--amp' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
