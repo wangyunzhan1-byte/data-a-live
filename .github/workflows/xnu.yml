@@ -61,16 +61,13 @@ jobs:
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           ls dxb/patches
 
-      - name: Verify iig replay cache
+      - name: Stage iig replay cache
         run: |
           chmod +x xnu-iig-cache.py
-          python3 xnu-iig-cache.py --verify "$XNU_DIR" "$XNU_IIG_CACHE"
-          # prove the replay tool parses the exact flags xnu's Makefile passes
-          head -1 "$IIG"; grep -n 'replay' "$IIG" | head -3
-        env:
-          XNU_DIR: ${{ github.workspace }}/xnu
-          XNU_IIG_CACHE: ${{ github.workspace }}/xnu/iig-pregen
-          IIG: ${{ github.workspace }}/xnu-iig-cache.py
+          # The cache is only useful if it covers the DriverKit inputs of the xnu tree
+          # build.sh is about to fetch; that tree does not exist yet, so check the cache's
+          # own integrity here, and the per-input source hashes in the Build step.
+          python3 wsl/check_iig_cache.py xnu/iig-pregen
 
       - name: Deps
         run: |
@@ -100,6 +97,13 @@ jobs:
           # belt and braces: fail the run loudly if anything reaches Apple's iig anyway
           IIG_MUST_NOT_RUN: "1"
         run: |
+          # before building: the cache must cover exactly this tree's DriverKit inputs
+          if [ -d xnu/iokit/DriverKit ]; then
+            python3 "$IIG" --verify xnu "$XNU_IIG_CACHE" || {
+              echo "::error::iig cache does not match this xnu tree"; exit 1; }
+          else
+            echo "note: xnu/ has no iokit/DriverKit yet (staged by build.sh); integrity was checked earlier"
+          fi
           bash build.sh
           # after the build: every DriverKit .iig must have produced the cached header,
           # and no generated file may carry a DriverKit-4xx (Xcode 16) stamp.
